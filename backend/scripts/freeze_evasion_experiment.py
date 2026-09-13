@@ -27,6 +27,7 @@ import json
 import logging
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from typing import List, Dict, Tuple
 from collections import defaultdict
@@ -54,64 +55,72 @@ def _run_smoke(output: Path, n_seeds: int, n_epochs: int, steps: int) -> None:
     subprocess.run(cmd, cwd=_BACKEND, check=True)
 
 
-def _analyze_evasion_pattern(csv_path: Path) -> Dict:
-    """Parse aggregate data and compute evasion patterns.
+def _analyze_evasion_pattern(output_dir: Path) -> Dict:
+    """Parse event logs from tar.gz cells and compute evasion patterns.
 
-    Extracts per-epoch evasion attempts and compares pre-freeze vs post-freeze rates.
+    Extracts freeze/unfreeze and audit_caught events for each agent seed,
+    comparing evasion rates before and after freeze release.
     """
-    # Read the sweep results
-    with open(csv_path) as f:
-        rows = list(csv.DictReader(f))
-
-    # Group by seed
-    by_seed = defaultdict(list)
-    for row in rows:
-        seed = row.get('seed_id')
-        if seed:
-            by_seed[seed].append(row)
-
-    # For each seed, compute:
-    # - Phase 1: epochs 1-15 (baseline evasion rate)
-    # - Phase 2: epochs 16-40 (after at least one freeze)
     pre_evasion_rates = []
     post_evasion_rates = []
-    freeze_events = []
+    freeze_events_all = []
 
-    for seed, rows_for_seed in by_seed.items():
-        # Rows should be sorted by epoch
-        rows_for_seed.sort(key=lambda r: int(r.get('epoch', 0)))
+    # Iterate over all seed tar.gz files
+    cells_dir = output_dir / "cells"
+    if not cells_dir.exists():
+        return {
+            'pre_evasion_rate': 0,
+            'post_evasion_rate': 0,
+            'pre_evasion_rates_by_seed': [],
+            'post_evasion_rates_by_seed': [],
+            'mean_freezes_per_run': 0,
+            'total_runs': 0,
+        }
 
-        # Phase 1: first half of epochs (baseline)
-        phase1_evasion = 0
-        phase1_count = 0
-        for r in rows_for_seed[:len(rows_for_seed)//2]:
-            if r.get('evasion_attempted'):
-                phase1_evasion += 1
-            phase1_count += 1
+    for cell_dir in sorted(cells_dir.iterdir()):
+        if not cell_dir.is_dir():
+            continue
 
-        if phase1_count > 0:
-            pre_evasion_rates.append(phase1_evasion / phase1_count)
+        for tar_file in sorted(cell_dir.glob("seed_*.tar.gz")):
+            # Extract and parse event log
+            try:
+                with tarfile.open(tar_file) as tf:
+                    # Find event_log.jsonl in the tar
+                    event_log_member = None
+                    for member in tf.getmembers():
+                        if member.name.endswith("event_log.jsonl"):
+                            event_log_member = member
+                            break
 
-        # Phase 2: second half (after freeze period)
-        phase2_evasion = 0
-        phase2_count = 0
-        for r in rows_for_seed[len(rows_for_seed)//2:]:
-            if r.get('evasion_attempted'):
-                phase2_evasion += 1
-            phase2_count += 1
+                    if not event_log_member:
+                        continue
 
-        if phase2_count > 0:
-            post_evasion_rates.append(phase2_evasion / phase2_count)
+                    # Extract and read event log
+                    event_file = tf.extractfile(event_log_member)
+                    if not event_file:
+                        continue
 
-        # Track freeze events
-        freeze_count = sum(1 for r in rows_for_seed if r.get('agent_frozen'))
-        if freeze_count > 0:
-            freeze_events.append(freeze_count)
+                    events = []
+                    for line in event_file:
+                        try:
+                            events.append(json.loads(line.decode()))
+                        except json.JSONDecodeError:
+                            continue
+
+                    # Analyze evasion patterns in this seed
+                    seed_analysis = _analyze_seed_events(events)
+                    if seed_analysis:
+                        pre_evasion_rates.append(seed_analysis['pre'])
+                        post_evasion_rates.append(seed_analysis['post'])
+                        freeze_events_all.append(seed_analysis['freeze_count'])
+            except Exception as e:
+                logger.warning(f"Failed to process {tar_file}: {e}")
+                continue
 
     # Aggregate statistics
     pre_mean = sum(pre_evasion_rates) / len(pre_evasion_rates) if pre_evasion_rates else 0
     post_mean = sum(post_evasion_rates) / len(post_evasion_rates) if post_evasion_rates else 0
-    freeze_mean = sum(freeze_events) / len(freeze_events) if freeze_events else 0
+    freeze_mean = sum(freeze_events_all) / len(freeze_events_all) if freeze_events_all else 0
 
     return {
         'pre_evasion_rate': pre_mean,
@@ -119,7 +128,79 @@ def _analyze_evasion_pattern(csv_path: Path) -> Dict:
         'pre_evasion_rates_by_seed': pre_evasion_rates,
         'post_evasion_rates_by_seed': post_evasion_rates,
         'mean_freezes_per_run': freeze_mean,
-        'total_runs': len(by_seed),
+        'total_runs': len(pre_evasion_rates),
+    }
+
+
+def _analyze_seed_events(events: List[Dict]) -> Dict:
+    """Analyze a single seed's events for freeze-evasion pattern.
+
+    Returns dict with 'pre', 'post', and 'freeze_count' or None if insufficient data.
+    """
+    # Track freeze/unfreeze events and audit_caught for evasive agents
+    agent_freeze_ranges = defaultdict(list)  # agent_id -> [(freeze_epoch, unfreeze_epoch), ...]
+    agent_audit_epochs = defaultdict(list)   # agent_id -> [epoch, epoch, ...]
+
+    active_freezes = {}  # agent_id -> freeze_start_epoch
+
+    for event in events:
+        event_type = event.get('event_type')
+        agent_id = event.get('agent_id', '')
+        epoch = event.get('epoch', 0)
+
+        if event_type == 'freeze':
+            active_freezes[agent_id] = epoch
+        elif event_type == 'unfreeze':
+            if agent_id in active_freezes:
+                freeze_start = active_freezes.pop(agent_id)
+                agent_freeze_ranges[agent_id].append((freeze_start, epoch))
+        elif event_type == 'audit_caught':
+            if 'evasive' in agent_id:  # Only track evasive agents
+                agent_audit_epochs[agent_id].append(epoch)
+
+    # For each evasive agent, compute pre- vs post-freeze evasion rates
+    if not agent_audit_epochs:
+        return None
+
+    pre_evasion_count = 0
+    post_evasion_count = 0
+    freeze_count = 0
+
+    for agent_id, audit_epochs in agent_audit_epochs.items():
+        if not audit_epochs:
+            continue
+
+        freeze_ranges = agent_freeze_ranges.get(agent_id, [])
+        freeze_count += len(freeze_ranges)
+
+        if freeze_ranges:
+            # Split audits into pre-freeze and post-release windows
+            # Pre-freeze: before first freeze
+            # Post-release: after last unfreeze
+            first_freeze_epoch = freeze_ranges[0][0]
+            last_unfreeze_epoch = freeze_ranges[-1][1]
+
+            # Count audits in pre-freeze phase
+            pre_count = sum(1 for e in audit_epochs if e < first_freeze_epoch)
+            # Count audits in post-release phase (after being unfrozen)
+            post_count = sum(1 for e in audit_epochs if e > last_unfreeze_epoch)
+
+            if pre_count > 0:
+                pre_evasion_count += pre_count
+            if post_count > 0:
+                post_evasion_count += post_count
+
+    if freeze_count == 0:
+        return None
+
+    # Compute rates (audits per agent)
+    pre_rate = pre_evasion_count / len(agent_audit_epochs) if agent_audit_epochs else 0
+    post_rate = post_evasion_count / len(agent_audit_epochs) if agent_audit_epochs else 0
+
+    return {
+        'pre': pre_rate,
+        'post': post_rate,
+        'freeze_count': freeze_count,
     }
 
 
@@ -241,15 +322,14 @@ def main(argv=None) -> None:
     if not args.skip_sweep:
         _run_smoke(args.output, args.n_seeds, args.epochs, args.steps)
 
-    # Analyze evasion patterns
-    csv_path = args.output / "aggregate_final.csv"
-    if csv_path.exists():
-        analysis = _analyze_evasion_pattern(csv_path)
+    # Analyze evasion patterns from event logs
+    analysis = _analyze_evasion_pattern(args.output)
+    if analysis and analysis['total_runs'] > 0:
         findings_md = _findings_md(analysis)
         (args.output / "FINDINGS.md").write_text(findings_md)
-        logger.info("wrote findings to %s", args.output / "FINDINGS.md")
+        logger.info("wrote findings to %s (%d runs analyzed)", args.output / "FINDINGS.md", analysis['total_runs'])
     else:
-        logger.warning("No aggregate_final.csv found at %s; skipping analysis", csv_path)
+        logger.warning("No event logs found or insufficient data for analysis at %s", args.output)
 
 
 if __name__ == "__main__":
